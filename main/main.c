@@ -12,6 +12,8 @@
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 
+#include "camera.h"
+
 
 #define CONFIG_EXAMPLE_UART_TXD 1
 #define CONFIG_EXAMPLE_UART_RXD 3
@@ -30,7 +32,9 @@
 #define SAU_TASK_STACK_SIZE    (CONFIG_EXAMPLE_TASK_STACK_SIZE)
 
 // 10240 20480 30720 - for mysterious reasons if the program is big enough, the uart_read_bytes will return 0 at some late point.
-#define SAU_BUF_SIZE 30720
+//#define SAU_SEND_BUF_SIZE 1024
+#define SAU_SEND_BUF_SIZE 30720
+#define SAU_RCV_BUF_SIZE 30720
 
 // Using the repeating structure we make sure "wxyz" is easily received (offset-independent)
 #define SAU_READY_MARKER "wxyz3wxyz2wxyz1wxyz0"
@@ -41,7 +45,7 @@
 static const char *TAG = "SAU";
 
 static void sau_led_on() {
-   //gpio_set_level(LED_GPIO, 1);
+   gpio_set_level(LED_GPIO, 1);
 }
 
 static void sau_led_off() {
@@ -80,33 +84,72 @@ static int sau_uart_read(uart_port_t uart_num, void *buf, uint32_t length, TickT
     return 0;
 }
 
+static int sau_uart_write(uart_port_t uart_num, const void *buf, uint32_t length) {
+    uint32_t num_sent = 0;
+    while (num_sent < length) {
+        int sent = uart_write_bytes(uart_num, (uint8_t*)buf + num_sent, length - num_sent);
+        if (sent < 0) {
+            ESP_LOGE(TAG, "uart_write_bytes failed with return value %d", sent);
+            return -1;
+        }
+        if (0 == sent) {
+            ESP_LOGW(TAG, "uart_write_bytes returned 0");
+        }
+        num_sent += sent;
+    }
+    return 0;
+}
+
 /**
  * @returns 0 on success, -1 on failure
  */
 static int sau_frame() {
-    sau_long_delay(); sau_led_blink_n(2);
-    // Send 11+abracadabra for now
-    uint32_t frame_size = 11U;
-
-    // // Convert frame_size to ascii
-    // char frame_size_str[10];
-    // snprintf(frame_size_str, 10, "%u", frame_size);
-    // // Send frame_size
-    // int rv = uart_write_bytes(SAU_PORT_NUM, frame_size_str, strlen(frame_size_str));
-
+    //d sau_long_delay(); sau_led_blink_n(2);
+    
+    camera_fb_t *fb = NULL;
+    esp_err_t err = camera_frame_take(&fb);
+    if (ESP_OK != err) {
+        ESP_LOGE(TAG, "camera_frame_take failed, err=%d", err);
+        return -1;
+    }
+    uint32_t frame_size = (uint32_t)fb->len;
+    assert (frame_size < 1000000U);
     assert(sizeof(uint32_t) == 4U);
-    int rv = uart_write_bytes(SAU_PORT_NUM, (const void*)&frame_size, 4U);
-    if (4 != rv) {
-        ESP_LOGE(TAG, "uart_write_bytes unexpectedly returned %d (expected 4)", rv);
+    //e sau_long_delay(); sau_led_blink_n(1);
+    //int rv = uart_write_bytes(SAU_PORT_NUM, (const void*)&frame_size, 4U);
+    int rv = sau_uart_write(SAU_PORT_NUM, (const void*)&frame_size, 4U);
+    //if (4 != rv) {
+    if (-1 == rv) {
+        //ESP_LOGE(TAG, "uart_write_bytes unexpectedly returned %d (expected 4)", rv);
+        ESP_LOGE(TAG, "sau_uart_write failed.");
         return -1;
     }
-    //frame_size = 11U;
-    const char* frame_data = "abracadabra";
-    rv = uart_write_bytes(SAU_PORT_NUM, frame_data, frame_size);
-    if (frame_size != rv) {
-        ESP_LOGE(TAG, "uart_write_bytes unexpectedly returned %d (expected %lu)", rv, frame_size);
+    //e sau_long_delay(); sau_led_blink_n(2);
+    uint8_t* frame_data = fb->buf;
+    //const char* frame_data = "hello";
+    //frame_size = 5;
+    for (uint32_t i=0; i < frame_size; i += SAU_SEND_BUF_SIZE) {
+        uint32_t bytes_to_send = (frame_size - i) < SAU_SEND_BUF_SIZE ? (frame_size - i) : SAU_SEND_BUF_SIZE;
+        rv = sau_uart_write(SAU_PORT_NUM, (const void*)(frame_data + i), bytes_to_send);
+        if (-1 == rv) {
+            ESP_LOGE(TAG, "sau_uart_write failed");
+            return -1;
+        }
+    }
+    //e sau_long_delay(); sau_led_blink_n(3);
+
+    //rv = uart_write_bytes(SAU_PORT_NUM, (const void*)frame_data, frame_size);
+    // if (frame_size != rv) {
+    //     ESP_LOGE(TAG, "uart_write_bytes unexpectedly returned %d (expected %lu)", rv, frame_size);
+    //     return -1;
+    // }
+    err = camera_frame_release(fb);
+
+    if (ESP_OK != err) {
+        ESP_LOGE(TAG, "camera_frame_release failed, err=%d", err);
         return -1;
     }
+    //e sau_long_delay(); sau_led_blink_n(4);
     return 0;
 }
 
@@ -129,7 +172,7 @@ static int sau_firmware_update() {
     //     return -1;
     // }
     if (-1 == rv) {
-        ESP_LOGE(TAG, "sau_uart_read_bytes failed");
+        ESP_LOGE(TAG, "sau_uart_read failed");
         return -1;
     }
     //ESP_LOGI(TAG, "update_size=%u", update_size);
@@ -146,44 +189,44 @@ static int sau_firmware_update() {
     }
     //sau_long_delay(); sau_led_blink_n(4);
     // Read new firmware chunk by chunk from uart and pass it to esp_ota_write
-    char update_data_buf[SAU_BUF_SIZE+1] = { 0 };
-    char ota_write_data[SAU_BUF_SIZE+1] = { 0 };
+    char update_data_buf[SAU_RCV_BUF_SIZE+1] = { 0 };
+    char ota_write_data[SAU_RCV_BUF_SIZE+1] = { 0 };
 
     ESP_LOGI(TAG, "update_size=%lu", update_size);
-    ESP_LOGI(TAG, "SAU_BUF_SIZE=%d", SAU_BUF_SIZE);
-    for (uint32_t i = 0; i < update_size; i += SAU_BUF_SIZE) {
+    ESP_LOGI(TAG, "SAU_RCV_BUF_SIZE=%d", SAU_RCV_BUF_SIZE);
+    for (uint32_t i = 0; i < update_size; i += SAU_RCV_BUF_SIZE) {
         assert(i < update_size);
-        uint32_t bytes_to_read = (update_size - i) < SAU_BUF_SIZE ? (update_size - i) : SAU_BUF_SIZE;
+        uint32_t bytes_to_read = (update_size - i) < SAU_RCV_BUF_SIZE ? (update_size - i) : SAU_RCV_BUF_SIZE;
         // 20 ms timeout, TODO change if needed
-        //memset(update_data_buf, 0, SAU_BUF_SIZE);
-        //memset(ota_write_data, 0, SAU_BUF_SIZE);
+        //memset(update_data_buf, 0, SAU_RCV_BUF_SIZE);
+        //memset(ota_write_data, 0, SAU_RCV_BUF_SIZE);
         //if ((i << 1) > update_size) {
             ESP_LOGI(TAG, "Reading %lu / %lu", i, update_size);
         //}
         rv = sau_uart_read(SAU_PORT_NUM, update_data_buf, bytes_to_read, 100 / portTICK_PERIOD_MS);
         // if (bytes_to_read != rv) {
-        //     ESP_LOGE(TAG, "uart_read_bytes unexpectedly returned %d (expected %d)", rv, SAU_BUF_SIZE);
+        //     ESP_LOGE(TAG, "uart_read_bytes unexpectedly returned %d (expected %d)", rv, SAU_RCV_BUF_SIZE);
         //     sau_long_delay(); sau_led_blink_n(4);
         //     return -1;
         //     //break;
         // }
         if (-1 == rv) {
             ESP_LOGE(TAG, "sau_uart_read failed");
-            sau_long_delay(); sau_led_blink_n(4);
+            //d sau_long_delay(); sau_led_blink_n(4);
             return -1;
         }
-        assert(bytes_to_read <= SAU_BUF_SIZE);
+        assert(bytes_to_read <= SAU_RCV_BUF_SIZE);
         memcpy(ota_write_data, update_data_buf, bytes_to_read);
         // ESP_LOGI(TAG, "Writing %lu / %lu", i, update_size);
         if (ESP_OK != esp_ota_write(ota_handle, (const void*)ota_write_data, bytes_to_read)) {
             ESP_LOGE(TAG, "esp_ota_write failed");
-            sau_long_delay(); sau_led_blink_n(6);
+            //d sau_long_delay(); sau_led_blink_n(6);
             return -1;
         }
     }
 
     ESP_LOGI(TAG, "Total bytes written: %lu", update_size);
-    sau_long_delay(); sau_led_blink_n(3);
+    //d sau_long_delay(); sau_led_blink_n(3);
 
     esp_err_t err = esp_ota_end(ota_handle);
     if (ESP_OK != err) {
@@ -221,20 +264,34 @@ static void sau_task(void *arg)
     intr_alloc_flags = ESP_INTR_FLAG_IRAM;
 #endif
 
-    ESP_ERROR_CHECK(uart_driver_install(SAU_PORT_NUM, SAU_BUF_SIZE * 2, 0, 0, NULL, intr_alloc_flags));
+    ESP_ERROR_CHECK(uart_driver_install(SAU_PORT_NUM, SAU_RCV_BUF_SIZE * 2, 0, 0, NULL, intr_alloc_flags));
     ESP_ERROR_CHECK(uart_param_config(SAU_PORT_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(SAU_PORT_NUM, SAU_TXD, SAU_RXD, SAU_RTS, SAU_CTS));
+
+    // uart_hw_flowcontrol_t uart_hw_flowctrl = UART_HW_FLOWCTRL_DISABLE;
+    // //uart_get_hw_flow_ctrl(SAU_PORT_NUM, &uart_hw_flowctrl);
+    // esp_err_t err = uart_set_hw_flow_ctrl(SAU_PORT_NUM, uart_hw_flowctrl, 0);
+    // if (ESP_OK != err) {
+    //     ESP_LOGE(TAG, "uart_set_hw_flow_ctrl failed, err=%d", err);
+    // }
+    // err = uart_set_sw_flow_ctrl(SAU_PORT_NUM, false, 0, 0);
+    // if (ESP_OK != err) {
+    //     ESP_LOGE(TAG, "uart_set_sw_flow_ctrl failed, err=%d", err);
+    // }
 
     ESP_LOGI(TAG, "UART%d configured:", SAU_PORT_NUM);
     // Send SAU_READY_MARKER via uart
     const char* readyMarker = SAU_READY_MARKER;
-    int rv = uart_write_bytes(SAU_PORT_NUM, readyMarker, SAU_READY_MARKER_LEN);
-    if (SAU_READY_MARKER_LEN != rv) {
-        ESP_LOGE(TAG, "uart_write_bytes unexpectedly returned %d (expected %d)", rv, SAU_READY_MARKER_LEN);
+    //int rv = uart_write_bytes(SAU_PORT_NUM, readyMarker, SAU_READY_MARKER_LEN);
+    int rv = sau_uart_write(SAU_PORT_NUM, readyMarker, SAU_READY_MARKER_LEN);
+    //if (SAU_READY_MARKER_LEN != rv) {
+    if (-1 == rv) {
+        //ESP_LOGE(TAG, "uart_write_bytes unexpectedly returned %d (expected %d)", rv, SAU_READY_MARKER_LEN);
+        ESP_LOGE(TAG, "sau_uart_write failed.");
     }
 
     char request;
-    sau_led_blink_n(5);
+    //e sau_led_blink_n(5);
     while (1) {
         // Read request (wait indefinitely)
         //sau_long_delay(); sau_led_blink_n(3);
@@ -277,5 +334,6 @@ void app_main(void)
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
     ESP_LOGI(TAG, "SAU");
     sau_led_off();
+    camera_init(/*FRAMESIZE_UXGA, 12*/);
     xTaskCreate(sau_task, "sau_task", SAU_TASK_STACK_SIZE, NULL, 10, NULL);
 }
