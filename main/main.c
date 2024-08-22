@@ -335,5 +335,6 @@ void app_main(void)
     ESP_LOGI(TAG, "SAU");
     sau_led_off();
     camera_init(/*FRAMESIZE_UXGA, 12*/);
+    esp_ota_mark_app_valid_cancel_rollback();
     xTaskCreate(sau_task, "sau_task", SAU_TASK_STACK_SIZE, NULL, 10, NULL);
 }
